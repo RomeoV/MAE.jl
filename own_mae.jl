@@ -87,6 +87,12 @@ function shuffle_patches(dst::Buffer, x, idx_keep, batch_size)
   return x_shuffled
 end
 
+## Encoder
+# 1) encode each patch into a 1d embedding
+# 2) add pos embed to patches
+# 3) shuffle patches and keep a small percentage
+# 4) make and prepend class token w/ positional embedding
+# 5) apply transformer
 function (m::MAEEncoder)(x)
   BATCH_SIZE = size(x)[end]
   # 1) encode each patch into a 1d embedding
@@ -100,7 +106,6 @@ function (m::MAEEncoder)(x)
   # This dispatches, depending on whether we have preallocated storage.
   perm = @ignore_derivatives randperm(m.npatches)
   idx_keep = perm[1:m.npatches_keep]
-  # x_masked = shuffle_patches(m.dst_prealloc, x, idx_keep, BATCH_SIZE)
   x_masked = x[:, idx_keep, :]
 
   # 4) make and prepend class token w/ positional embedding
@@ -153,31 +158,6 @@ function MAEDecoder(in_dim::I, npatches;
   return MAEDecoder( decoder_emb, pos_emb, norm, mask_tokens, model_dec, decoder_pred, npatches, npatches_keep, dst_prealloc )
 end
 
-function unshuffle_patches(dst::Nothing, x, perm, batch_size)
-  perm_rev = @ignore_derivatives sortperm(perm)
-  x_unshuffled = cat([gather(x_, perm_rev) for x_ in eachslice(x, dims=3)]...;
-                     dims=3)
-  return x_unshuffled
-end
-
-function unshuffle_patches(dst::AA3, x, perm, batch_size)
-  perm_rev = @ignore_derivatives sortperm(perm)
-  # for (dst_, x_) in zip(eachslice(dst; dims=3),
-  #                       eachslice(x;   dims=3))
-  #   gather!(dst_, x_, perm_rev)
-  # end
-  # x_unshuffled = 0*x + dst;
-  x_unshuffled = x[:, perm, :]
-  return x_unshuffled
-end
-
-function unshuffle_patches_alternative(dst::AA3, x, perm, batch_size)
-  perm_rev = @ignore_derivatives sortperm(perm)
-  gather!(dst, x, [CartesianIndex(idx, b) for idx in perm_rev,
-                                              b in 1:batch_size])
-  x_unshuffled = 0*x + dst;  # just setting x = dst doesn't carry the gradient properly...
-  return x_unshuffled
-end
 
 ## Decoder
 # 1) redo embedding
@@ -185,7 +165,6 @@ end
 # 3) unshuffle
 # 4) add pos embedding
 # 5) send through transformer and normalize
-
 function (m::MAEDecoder)((x, perm)::Tuple)
   BATCH_SIZE = size(x)[end]
 
