@@ -5,6 +5,12 @@ import Random: randperm
 import Zygote.ChainRules: @ignore_derivatives
 import Flux
 import Flux: LayerNorm, Dense, Chain
+using Tullio
+using KernelAbstractions, CUDA
+using CUDA.CUDAKernels
+# import Tullio: @tullio
+CUDA.allowscalar(false)
+
 
 const AA3{T} = AbstractArray{T, 3}
 
@@ -14,6 +20,8 @@ struct MAEEncoder
   pos_emb
   norm
   backbone
+  img_size::Tuple{Integer, Integer}
+  patch_size::Tuple{Integer, Integer}
   npatches::Integer
   npatches_keep::Integer
 end
@@ -35,7 +43,7 @@ function MAEEncoder(img_size::Tuple{I, I};
   model_enc = Chain([prenorm(embedplanes,
                              MultiHeadSelfAttention(embedplanes))
                      for _ in 1:nblocks]...)
-  return MAEEncoder( patch_emb, class_token, pos_emb, emb_norm, model_enc, npatches, npatches_keep )
+  return MAEEncoder( patch_emb, class_token, pos_emb, emb_norm, model_enc, img_size, patch_size, npatches, npatches_keep )
 end
 
 ## Encoder
@@ -79,6 +87,8 @@ struct MAEDecoder{M<:AA3}
   mask_tokens::M
   backbone
   decoder_pred
+  img_size::Tuple{Integer, Integer}
+  patch_size::Tuple{Integer, Integer}
   npatches::Integer
   npatches_keep::Integer
 end
@@ -89,13 +99,15 @@ Flux.trainable(m::MAEDecoder) = (m.decoder_emb,
                                  m.backbone,
                                  m.decoder_pred)  # no pos embedding
 
-function MAEDecoder(in_dim::I, npatches;
+function MAEDecoder(img_size::Tuple{I, I}, input_emb_dim::I;
                     embedplanes::I=64,
                     patch_size::Tuple{I,I}=(16,16),
                     nblocks::I=3,
                     pct_patches_keep=0.25) where I <: Integer
+  @assert all(==(0), img_size .% patch_size) "`img_size` must be cleanly divisible by `patch_size`."
+  npatches = img_size .÷ patch_size |> prod
   npatches_keep = floor(Int, npatches*pct_patches_keep)
-  decoder_emb = Dense(in_dim, embedplanes)
+  decoder_emb = Dense(input_emb_dim, embedplanes)
   pos_emb = ViPosEmbedding(embedplanes, npatches+1)
   norm = LayerNorm(embedplanes)
   mask_tokens = 1//2*ones(Float32, embedplanes, 1, 1)  # currently this receives no gradient!!
@@ -103,7 +115,7 @@ function MAEDecoder(in_dim::I, npatches;
                              MultiHeadSelfAttention(embedplanes))
                      for _ in 1:nblocks]...);
   decoder_pred = Dense(embedplanes, prod(patch_size)*3)
-  return MAEDecoder( decoder_emb, pos_emb, norm, mask_tokens, model_dec, decoder_pred, npatches, npatches_keep )
+  return MAEDecoder( decoder_emb, pos_emb, norm, mask_tokens, model_dec, decoder_pred, img_size, patch_size, npatches, npatches_keep )
 end
 
 
@@ -141,9 +153,15 @@ function (m::MAEDecoder)(x::AA3, perm::Vector)
   x = m.norm(x);
   x = m.decoder_pred(x)
   x = x[:, 2:end, :];
-  x
+
+  h, w = m.img_size .÷ m.patch_size
+  x = reshape(x, 3, m.patch_size..., h, w, BATCH_SIZE)
+  # @tullio x_[p1, h, p2, w, c, b] := x[c, p1, p2, h, w, b]
+  x = permutedims(x, (2, 4, 3, 5, 1, 6))
+  x = reshape(x, h*m.patch_size[1], w*m.patch_size[2], 3, BATCH_SIZE)
+  sigmoid(x)
 end
 (m::MAEDecoder)((x, perm)::Tuple) = m(x, perm)
 
 make_model(; batch_size=nothing) = Chain(MAEEncoder((224, 224)),
-                                         MAEDecoder(128, 14*14))
+                                         MAEDecoder((224, 224), 128, 14*14))
