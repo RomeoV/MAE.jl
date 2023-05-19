@@ -2,21 +2,28 @@ import Metalhead: PatchEmbedding, ClassTokens, ViPosEmbedding
 import Metalhead: MultiHeadSelfAttention,
                   prenorm  # applies LayerNorm, then the next module
 import Random: randperm
-import NNlib: gather!  # we use this for shuffling and unshuffling
+import NNlib: gather, gather!  # we use this for shuffling and unshuffling
+import Zygote: withgradient, Buffer
 import Zygote.ChainRules: @ignore_derivatives
 using SimpleConfig
 using Flux
 import MLUtils: zeros_like, ones_like
+using ProgressBars
 import Random: seed!
+using BenchmarkTools
 seed!(1)
 
-struct MAEEncoder
+const AA3{T} = AbstractArray{T, 3}
+
+struct MAEEncoder{P}
   patch_emb
   class_token
   pos_emb
   norm
   backbone
-  npatches
+  npatches::Integer
+  npatches_keep::Integer
+  dst_prealloc::P
 end
 Flux.@functor MAEEncoder
 Flux.trainable(m::MAEEncoder) = (m.patch_emb, m.class_token, m.norm, m.backbone)  # no pos embedding
@@ -24,55 +31,91 @@ Flux.trainable(m::MAEEncoder) = (m.patch_emb, m.class_token, m.norm, m.backbone)
 function MAEEncoder(img_size::Tuple{I, I};
                     embedplanes::I=128,
                     patch_size::Tuple{I,I}=(16,16),
-                    nblocks::I=3) where I <: Integer
+                    nblocks::I=3,
+                    pct_patches_keep=.25,
+                    prealloc_batch_size::Union{I, Nothing}=nothing) where I <: Integer
   @assert all(==(0), img_size .% patch_size) "`img_size` must be cleanly divisible by `patch_size`."
   npatches = img_size .÷ patch_size |> prod
+  npatches_keep = floor(Int, npatches*pct_patches_keep)
   patch_emb = PatchEmbedding(img_size; embedplanes, patch_size)
   class_token = ClassTokens(embedplanes)
   pos_emb =   ViPosEmbedding(embedplanes, npatches+1)
   emb_norm =  LayerNorm(embedplanes)
   model_enc = Chain([prenorm(embedplanes,
                              MultiHeadSelfAttention(embedplanes))
-                     for _ in 1:nblocks]...);
-  return MAEEncoder( patch_emb, class_token, pos_emb, emb_norm, model_enc, npatches )
+                     for _ in 1:nblocks]...)
+  dst_prealloc = (!isnothing(prealloc_batch_size) ? zeros(Float32, embedplanes, npatches_keep, prealloc_batch_size)
+                                                  : nothing)
+  return MAEEncoder( patch_emb, class_token, pos_emb, emb_norm, model_enc, npatches, npatches_keep, dst_prealloc )
+end
+
+function shuffle_patches(dst::Nothing, x, idx_keep, batch_size)
+  x_shuffled = cat([gather(x_, idx_keep) for x_ in eachslice(x; dims=3)]...;
+                   dims=3)
+  return x_shuffled
+end
+
+# function shuffle_patches(dst::AA3, x, idx_keep, batch_size)
+#   gather!(dst, x, [CartesianIndex(idx, b) for idx in idx_keep,
+#                                               b in 1:batch_size])
+#   x_shuffled = 0*x[:, 1:length(idx_keep), :] + dst;  # just setting x = dst doesn't carry the gradient properly...
+#   return x_shuffled
+# end
+
+# function shuffle_patches(dst::AA3, x, idx_keep, batch_size)
+#   map((dst_, x_)::Tuple->gather!(dst_, x_, idx_keep),
+#       zip(eachslice(dst; dims=3),
+#           eachslice(x;   dims=3)))
+#   # for (dst_, x_) in zip(eachslice(dst; dims=3),
+#   #                       eachslice(x;   dims=3))
+#   #   gather!(dst_, x_, idx_keep)
+#   # end
+#   x_shuffled = copy(dst)
+#   return x_shuffled
+# end
+
+function shuffle_patches(dst::AA3, x, idx_keep, batch_size)
+  x_shuffled = x[:, idx_keep, :]
+  return x_shuffled
+end
+
+function shuffle_patches(dst::Buffer, x, idx_keep, batch_size)
+  @info "Using buffer :)"
+  gather!(dst, x, [CartesianIndex(idx, b) for idx in idx_keep,
+                                              b in 1:batch_size])
+  x_shuffled = copy(dst);  # just setting x = dst doesn't carry the gradient properly...
+  return x_shuffled
 end
 
 function (m::MAEEncoder)(x)
   BATCH_SIZE = size(x)[end]
-  # 1)
+  # 1) encode each patch into a 1d embedding
+  # (usually conv|>flatten or flatten|>dense)
   x = m.patch_emb(x);
 
-  # 2)
+  # 2) add pos embed to patches
   x = x .+ m.pos_emb.vectors[:, 2:end]
 
-  # 3)
+  # 3) shuffle patches and keep a small percentage
+  # This dispatches, depending on whether we have preallocated storage.
   perm = @ignore_derivatives randperm(m.npatches)
-  idx_keep = perm[1:m.npatches÷4]
-  # idx_keep = begin
-  #   idx_keep = perm[1:m.npatches÷4]
-  #   [CartesianIndex(idx, b) for idx in idx_keep,
-  #                               b in 1:BATCH_SIZE]
-  # end
-  # dst =  ones_like(x, (size(x, 1), size(idx_keep, 1), BATCH_SIZE));  # preallocate this!
-  # gather!(dst, x, idx_keep)
-  # x_masked = dst;
-  x_masked = cat([gather(x_, idx_keep) for x_ in eachslice(x; dims=3)]...;
-                 dims=3)
+  idx_keep = perm[1:m.npatches_keep]
+  # x_masked = shuffle_patches(m.dst_prealloc, x, idx_keep, BATCH_SIZE)
+  x_masked = x[:, idx_keep, :]
 
-  # 4)
+  # 4) make and prepend class token w/ positional embedding
   class_emb = repeat(m.class_token.token .+ m.pos_emb.vectors[:, 1],
                      1, 1, BATCH_SIZE);
   x = cat(class_emb, x_masked;
           dims=2);
 
-  # 5)
-  y = m.backbone(x);
-  y = m.norm(y);
-  return y, perm
+  # 5) apply transformer
+  x = m.backbone(x);
+  x = m.norm(x);
+  return x, perm
 end
 
-const AA3{T} = AbstractArray{T, 3}
-struct MAEDecoder{M<:AA3}
+struct MAEDecoder{M<:AA3, P}
   decoder_emb
   pos_emb
   norm
@@ -80,6 +123,8 @@ struct MAEDecoder{M<:AA3}
   backbone
   decoder_pred
   npatches::Integer
+  npatches_keep::Integer
+  dst_prealloc::P
 end
 Flux.@functor MAEDecoder
 Flux.trainable(m::MAEDecoder) = (m.decoder_emb,
@@ -91,7 +136,10 @@ Flux.trainable(m::MAEDecoder) = (m.decoder_emb,
 function MAEDecoder(in_dim::I, npatches;
                     embedplanes::I=64,
                     patch_size::Tuple{I,I}=(16,16),
-                    nblocks::I=3) where I <: Integer
+                    nblocks::I=3,
+                    pct_patches_keep=0.25,
+                    prealloc_batch_size::Union{I, Nothing}=0) where I <: Integer
+  npatches_keep = floor(Int, npatches*pct_patches_keep)
   decoder_emb = Dense(in_dim, embedplanes)
   pos_emb = ViPosEmbedding(embedplanes, npatches+1)
   norm = LayerNorm(embedplanes)
@@ -100,59 +148,36 @@ function MAEDecoder(in_dim::I, npatches;
                              MultiHeadSelfAttention(embedplanes))
                      for _ in 1:nblocks]...);
   decoder_pred = Dense(embedplanes, prod(patch_size)*3)
-  return MAEDecoder( decoder_emb, pos_emb, norm, mask_tokens, model_dec, decoder_pred, npatches )
+  dst_prealloc = (!isnothing(prealloc_batch_size) ? 1//3*ones(Float32, embedplanes, npatches, prealloc_batch_size)
+                                                  : nothing)
+  return MAEDecoder( decoder_emb, pos_emb, norm, mask_tokens, model_dec, decoder_pred, npatches, npatches_keep, dst_prealloc )
 end
 
-dst = zeros(Float32, 64, 14*14, 7)
-function (m::MAEDecoder)((x, perm)::Tuple)
-  BATCH_SIZE = size(x)[end]
+function unshuffle_patches(dst::Nothing, x, perm, batch_size)
   perm_rev = @ignore_derivatives sortperm(perm)
-
-  # 1)
-  x = m.decoder_emb(x);
-  DIM_SIZE = size(x, 1)
-
-  # 2)
-  cls, x = x[:, 1:1, :], x[:, 2:end, :];
-  x = cat(  x
-          , repeat(m.mask_tokens,
-                   1, m.npatches - size(x, 2), BATCH_SIZE)
-          ; dims=2);
-
-  # # 3)
-  # currently, the gradient doesn't flow right through this...
-  # dst = zeros_like(x, (DIM_SIZE, m.npatches, BATCH_SIZE))
-  # dst = zeros(Float32, DIM_SIZE, m.npatches, BATCH_SIZE)
-  # gather!(dst, x, [CartesianIndex(idx, b) for idx in perm_rev,
-  #                                             b in 1:BATCH_SIZE])
-  # x = 0*x + dst;
-  x = cat([gather(x_, perm_rev) for x_ in eachslice(x, dims=3)]...;
-          dims=3)
-  # x_ = gather(x, [CartesianIndex(idx, b) for idx in perm_rev,
-  #                                             b in 1:BATCH_SIZE])
-  @assert size(x, 2) == m.npatches
-  x = cat(cls, x; dims=2);
-
-  # 4)
-  x = x .+ m.pos_emb.vectors;
-
-  # 5)
-  x = m.backbone(x);
-  x = m.norm(x);
-  x = m.decoder_pred(x)
-  x = x[:, 2:end, :];
-  x
+  x_unshuffled = cat([gather(x_, perm_rev) for x_ in eachslice(x, dims=3)]...;
+                     dims=3)
+  return x_unshuffled
 end
 
-make_model() = Chain(MAEEncoder((224, 224)), MAEDecoder(128, 14*14))
+function unshuffle_patches(dst::AA3, x, perm, batch_size)
+  perm_rev = @ignore_derivatives sortperm(perm)
+  # for (dst_, x_) in zip(eachslice(dst; dims=3),
+  #                       eachslice(x;   dims=3))
+  #   gather!(dst_, x_, perm_rev)
+  # end
+  # x_unshuffled = 0*x + dst;
+  x_unshuffled = x[:, perm, :]
+  return x_unshuffled
+end
 
-
-## ENCODER
-# 1) patch embed
-# 2) add pos embed
-# 3) mask x
-# 4) make class token + pos embed, and prepend
-# 5) send through transformer and normalize
+function unshuffle_patches_alternative(dst::AA3, x, perm, batch_size)
+  perm_rev = @ignore_derivatives sortperm(perm)
+  gather!(dst, x, [CartesianIndex(idx, b) for idx in perm_rev,
+                                              b in 1:batch_size])
+  x_unshuffled = 0*x + dst;  # just setting x = dst doesn't carry the gradient properly...
+  return x_unshuffled
+end
 
 ## Decoder
 # 1) redo embedding
@@ -161,19 +186,36 @@ make_model() = Chain(MAEEncoder((224, 224)), MAEDecoder(128, 14*14))
 # 4) add pos embedding
 # 5) send through transformer and normalize
 
-imgs = rand(Float32, 224, 224, 3, 32);
-m = make_model()
-m(imgs);
-gs = gradient(Flux.params(m)) do
-  m(imgs) |> sum  # check the gradients...
-end;
-# check the gradients...
-[k[1:3] for (k, v) in gs.grads if isnothing(v)]
+function (m::MAEDecoder)((x, perm)::Tuple)
+  BATCH_SIZE = size(x)[end]
 
-m_gpu = m |> gpu;
-imgs_gpu = imgs |> gpu;
-m_gpu(imgs_gpu);
-for _ in 1:100
-  m_gpu(imgs_gpu);
+  # 1) project embedding into new space
+  x = m.decoder_emb(x);
+  DIM_SIZE = size(x, 1)
+
+  # 2) remove class token, append learnable mask token
+  cls, x = x[:, 1:1, :], x[:, 2:end, :];
+  x = cat(  x
+          , repeat(m.mask_tokens,
+                   1, m.npatches - size(x, 2), BATCH_SIZE)
+          ; dims=2);
+
+  # 3) unshuffle and prepend class token again
+  # x = unshuffle_patches(m.dst_prealloc, x, perm, BATCH_SIZE)
+  x = x[:, sortperm(perm), :]
+  @assert size(x, 2) == m.npatches
+  x = cat(cls, x; dims=2);
+
+  # 4) add new positional embedding
+  x = x .+ m.pos_emb.vectors;
+
+  # 5) apply transformer
+  x = m.backbone(x);
+  x = m.norm(x);
+  x = m.decoder_pred(x)
+  x = x[:, 2:end, :];
+  x
 end
 
+make_model(; batch_size=nothing) = Chain(MAEEncoder((224, 224); prealloc_batch_size=batch_size),
+                                         MAEDecoder(128, 14*14; prealloc_batch_size=batch_size))
