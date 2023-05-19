@@ -1,5 +1,5 @@
 import Metalhead: PatchEmbedding, ClassTokens, ViPosEmbedding,
-                  MultiHeadSelfAttention,
+                  MultiHeadSelfAttention, transformer_encoder,
                   prenorm  # applies LayerNorm, then the next module
 import Random: randperm
 import Zygote.ChainRules: @ignore_derivatives
@@ -31,7 +31,7 @@ Flux.trainable(m::MAEEncoder) = (m.patch_emb, m.class_token, m.norm, m.backbone)
 function MAEEncoder(img_size::Tuple{I, I};
                     embedplanes::I=128,
                     patch_size::Tuple{I,I}=(16,16),
-                    nblocks::I=3,
+                    nblocks::I=12,
                     pct_patches_keep=.25) where I <: Integer
   @assert all(==(0), img_size .% patch_size) "`img_size` must be cleanly divisible by `patch_size`."
   npatches = img_size .÷ patch_size |> prod
@@ -40,9 +40,10 @@ function MAEEncoder(img_size::Tuple{I, I};
   class_token = ClassTokens(embedplanes)
   pos_emb =   ViPosEmbedding(embedplanes, npatches+1)
   emb_norm =  LayerNorm(embedplanes)
-  model_enc = Chain([prenorm(embedplanes,
-                             MultiHeadSelfAttention(embedplanes))
-                     for _ in 1:nblocks]...)
+  # model_enc = Chain([prenorm(embedplanes,
+  #                            MultiHeadSelfAttention(embedplanes))
+  #                    for _ in 1:nblocks]...)
+  model_enc = transformer_encoder(embedplanes, nblocks, 8)
   return MAEEncoder( patch_emb, class_token, pos_emb, emb_norm, model_enc, img_size, patch_size, npatches, npatches_keep )
 end
 
@@ -111,9 +112,7 @@ function MAEDecoder(img_size::Tuple{I, I}, input_emb_dim::I;
   pos_emb = ViPosEmbedding(embedplanes, npatches+1)
   norm = LayerNorm(embedplanes)
   mask_tokens = 1//2*ones(Float32, embedplanes, 1, 1)  # currently this receives no gradient!!
-  model_dec = Chain([prenorm(embedplanes,
-                             MultiHeadSelfAttention(embedplanes))
-                     for _ in 1:nblocks]...);
+  model_dec = transformer_encoder(embedplanes, nblocks, 8)
   decoder_pred = Dense(embedplanes, prod(patch_size)*3)
   return MAEDecoder( decoder_emb, pos_emb, norm, mask_tokens, model_dec, decoder_pred, img_size, patch_size, npatches, npatches_keep )
 end
@@ -159,9 +158,9 @@ function (m::MAEDecoder)(x::AA3, perm::Vector)
   # @tullio x_[p1, h, p2, w, c, b] := x[c, p1, p2, h, w, b]
   x = permutedims(x, (2, 4, 3, 5, 1, 6))
   x = reshape(x, h*m.patch_size[1], w*m.patch_size[2], 3, BATCH_SIZE)
-  sigmoid(x)
+  x
 end
 (m::MAEDecoder)((x, perm)::Tuple) = m(x, perm)
 
 make_model(; batch_size=nothing) = Chain(MAEEncoder((224, 224)),
-                                         MAEDecoder((224, 224), 128, 14*14))
+                                         MAEDecoder((224, 224), 128))
