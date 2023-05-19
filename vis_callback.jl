@@ -1,5 +1,6 @@
 using Flux, FluxTraining
 using FastVision: RGB
+import ImageCore: colorview
 struct VisualizationCallback <: FluxTraining.Callback 
   task
   device
